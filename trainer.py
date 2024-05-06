@@ -1,3 +1,5 @@
+import sys
+sys.path.append('../')
 import argparse
 import os
 import shutil
@@ -10,21 +12,28 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+from tensorboardX import SummaryWriter
+
 import resnet
+from lightvit import lightvit_tiny_cifar
+# from resnet import sASN
+from experiments.activation.acts import *
+from experiments.data.datasets import CIFAR10,CIFAR100
+from utils import MetricsTracker,plot_and_save_results
 
 model_names = sorted(name for name in resnet.__dict__
     if name.islower() and not name.startswith("__")
                      and name.startswith("resnet")
                      and callable(resnet.__dict__[name]))
-
+model_names.append('lightvit')
 print(model_names)
 
-parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
+parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10/100 in pytorch')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet32',
                     choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) +
                     ' (default: resnet32)')
+
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
@@ -49,26 +58,48 @@ parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('--half', dest='half', action='store_true',
                     help='use half-precision(16-bit) ')
-parser.add_argument('--save-dir', dest='save_dir',
+parser.add_argument('--save_folder', dest='save_folder',
                     help='The directory used to save the trained models',
                     default='save_temp', type=str)
 parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
-best_prec1 = 0
+parser.add_argument('--act', dest='activation function',
+                    help='lower string. ex. sASN : sasn',
+                    default='none', type=str)
+parser.add_argument('-n', dest='n_classes',
+                    help='n',
+                    default=10, type=int)
+parser.add_argument('--repeat', default=1, type=int, help='number of repetitive training')
 
+args = parser.parse_args()
 
-def main():
-    global args, best_prec1
-    args = parser.parse_args()
+def main(act,act_name,i):
+    
+    dataset_class = CIFAR10 if args.n_classes == 10 else CIFAR100
+    save_folder = args.save_folder
+    if not os.path.isdir(save_folder):
+        os.makedirs(save_folder)
+        print('make dirs ',save_folder)
+    log_dir_name = args.save_folder.split('/')[1]
+    log_dir=os.path.join('logs', f'{log_dir_name}',f'{args.arch}',f'{act_name}_{i}')
+    print('log_dir : ',log_dir)
+    writer = SummaryWriter(logdir=log_dir)
 
-
+    # TODO:parse activation
+    args.act = act
+    print('args:',args)
     # Check the save_dir exists or not
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
 
-    model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+    # model state #########################################################
+    if args.arch == 'lightvit':
+        model= lightvit_tiny_cifar(act_layer=args.act,num_classes=args.n_classes)
+        model = torch.nn.DataParallel(model)
+    else:
+        model = torch.nn.DataParallel(resnet.__dict__[args.arch](act=args.act,num_classes=args.n_classes))
+    model_type = args.arch
     model.cuda()
+    cudnn.benchmark = True
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -83,30 +114,29 @@ def main():
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    cudnn.benchmark = True
-
+    
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
+            dataset_class(train=True, transform=transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(32, 4),
             transforms.ToTensor(),
             normalize,
-        ]), download=True),
+        ]),),
         batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
+            dataset_class(train=False, transform=transforms.Compose([
             transforms.ToTensor(),
             normalize,
         ])),
         batch_size=128, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
-    # define loss function (criterion) and optimizer
+    # define loss function (criterion) and optimizer ############################
     criterion = nn.CrossEntropyLoss().cuda()
 
     if args.half:
@@ -120,42 +150,75 @@ def main():
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                         milestones=[100, 150], last_epoch=args.start_epoch - 1)
 
-    if args.arch in ['resnet1202', 'resnet110']:
+    if args.arch in ['resnet1202', 'resnet110','lightvit']:
         # for resnet1202 original paper uses lr=0.01 for first 400 minibatches for warm-up
         # then switch back. In this setup it will correspond for first epoch.
         for param_group in optimizer.param_groups:
             param_group['lr'] = args.lr*0.1
 
-
     if args.evaluate:
         validate(val_loader, model, criterion)
         return
+    
+    print('act:',args.act)
+    metrics_tracker = MetricsTracker()
+    best_acc,best_state = -1.,{}
+    best_model_file_name = ""
 
     for epoch in range(args.start_epoch, args.epochs):
-
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        train(train_loader, model, criterion, optimizer, epoch)
+        train_re = train(train_loader, model, criterion, optimizer, epoch)
         lr_scheduler.step()
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        val_re = validate(val_loader, model, criterion)
+
+        metrics_tracker.update(train_loss=train_re['loss'], train_acc=train_re['top1'],val_loss=val_re['loss'], val_acc =val_re['top1'])
 
         # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
+        acc = val_re['top1']
+        if acc > best_acc:
+            print('Saving..')
+            state = {
+                'net': model.state_dict(),
+                'acc': acc, # will be removed
+                'epoch': epoch,
+                'act' : act,
+                'top1':val_re['top1'],
+                'top5':val_re['top5']
+            }
+            if best_model_file_name:
+                try:
+                    # Attempt to remove the previous best model's checkpoint
+                    os.remove(f'./{save_folder}/{best_model_file_name}')
+                except:
+                    pass
+            best_model_file_name = f'{i}_ckpt_{model_type}_{dataset_class.__name__}_{act_name}_{val_re["top1"]:.2f}.pth'
+            torch.save(state, f'./{save_folder}/{best_model_file_name}')
+            best_acc = acc
+            best_state = state
+        
+        metrics_tracker.plot_and_save('./plot_re/',f'curr_{args.act}_{args.arch}.png')
+        # Logging to TensorBoard
+        writer.add_scalar('Loss/train', train_re['loss'], epoch)
+        writer.add_scalar('Accuracy-top1/train', train_re['top1'], epoch)
+        writer.add_scalar('Loss/val', val_re['loss'], epoch)
+        writer.add_scalar('Accuracy-top1/val', val_re['top1'], epoch)
+        if args.n_classes == 100:
+            writer.add_scalar('Accuracy-top5/val', val_re['top5'], epoch)
 
-        if epoch > 0 and epoch % args.save_every == 0:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
-
-        save_checkpoint({
-            'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+    print(best_state['act'],' ',best_state['epoch'],' ',best_state['acc'])
+    
+    res = {
+        'act':name,
+        'model':args.arch,
+        'train_loss':metrics_tracker.train_loss,
+        'train_acc':metrics_tracker.train_acc,
+        'val_loss':metrics_tracker.val_loss,
+        'val_acc':metrics_tracker.val_acc,
+    }
+    return res
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
@@ -166,6 +229,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
+    top5 = AverageMeter()
 
     # switch to train mode
     model.train()
@@ -176,27 +240,29 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda()
-        input_var = input.cuda()
-        target_var = target
+        targets = target.cuda()
+        inputs = input.cuda()
         if args.half:
-            input_var = input_var.half()
+            inputs = inputs.half()
+            targets = target.half()
 
         # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        output = output.float()
-        loss = loss.float()
         # measure accuracy and record loss
-        prec1 = accuracy(output.data, target)[0]
-        losses.update(loss.item(), input.size(0))
-        top1.update(prec1.item(), input.size(0))
+        if args.n_classes == 10:
+            prec1 = accuracy(outputs,targets,topk=(1,))[0]
+        else:
+            prec1,prec5 = accuracy(outputs,targets,topk=(1,5))
+            top5.update(prec5.item(),inputs.size(0))
+        top1.update(prec1.item(),inputs.size(0))
+        losses.update(loss.item(),inputs.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -210,7 +276,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1))
+            
+    results = {
+        'loss':losses.avg,
+        'top1':top1.avg,
+        'top5':top5.avg if args.n_classes == 100 else 0.,
+    }
 
+    return results
 
 def validate(val_loader, model, criterion):
     """
@@ -219,6 +292,7 @@ def validate(val_loader, model, criterion):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
+    top5 = AverageMeter()
 
     # switch to evaluate mode
     model.eval()
@@ -226,24 +300,24 @@ def validate(val_loader, model, criterion):
     end = time.time()
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
-            target = target.cuda()
-            input_var = input.cuda()
-            target_var = target.cuda()
+            inputs = input.cuda()
+            targets = target.cuda()
 
             if args.half:
-                input_var = input_var.half()
+                inputs = inputs.half()
 
             # compute output
-            output = model(input_var)
-            loss = criterion(output, target_var)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
-            output = output.float()
-            loss = loss.float()
-
-            # measure accuracy and record loss
-            prec1 = accuracy(output.data, target)[0]
-            losses.update(loss.item(), input.size(0))
-            top1.update(prec1.item(), input.size(0))
+             # top-1 top-5 acc
+            if args.n_classes == 10:
+                prec1 = accuracy(outputs.float().data,targets,topk=(1,))[0]
+            else:
+                prec1,prec5 = accuracy(outputs.float().data,targets,topk=(1,5))
+                top5.update(prec5.item(),inputs.size(0))
+            top1.update(prec1.item(),inputs.size(0))
+            losses.update(loss.item(),inputs.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -259,14 +333,20 @@ def validate(val_loader, model, criterion):
 
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
+    
+    results = {
+        'top1':top1.avg,
+        'top5':top5.avg if args.n_classes==100 else 0.,
+        'loss':losses.avg,
+    }
 
-    return top1.avg
+    return results
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    """
-    Save the training model
-    """
-    torch.save(state, filename)
+# def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+#     """
+#     Save the training model
+#     """
+#     torch.save(state, filename)
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -297,10 +377,20 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
 
 if __name__ == '__main__':
-    main()
+    acts=get_activations()
+    # acts['PReLU']=nn.PReLU()
+    print(acts.keys())
+    comp_dict = {}
+    for i in range(1,args.repeat+1):
+        for name,act in acts.items():
+            print(f'act : {name}')
+            res = main(act,name,i)
+            comp_dict[name]=res
+            comp_dict['model']=res['model']
+        plot_and_save_results(comp_dict,os.path.join('results',f'{args.save_folder}',comp_dict['model']))

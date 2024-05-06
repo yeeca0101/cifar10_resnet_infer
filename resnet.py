@@ -42,6 +42,15 @@ def _weights_init(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
         init.kaiming_normal_(m.weight)
 
+# class sASN(nn.Module):
+#     def __init__(self, beta_init=1.0, alpha=0.1,requires_grad=True):
+#         super(sASN, self).__init__()
+#         self.beta = nn.Parameter(torch.tensor([beta_init]),requires_grad=requires_grad)  # Learnable parameter
+#         self.alpha = alpha  # Could also be made learnable if desired
+
+#     def forward(self, x):
+#         return x * torch.sigmoid(self.beta * x) + self.alpha * torch.tanh(x)
+    
 class LambdaLayer(nn.Module):
     def __init__(self, lambd):
         super(LambdaLayer, self).__init__()
@@ -54,12 +63,13 @@ class LambdaLayer(nn.Module):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes, stride=1, option='A'):
+    def __init__(self, in_planes, planes, stride=1, option='A',act=nn.ReLU()):
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
+        self.act=act
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != planes:
@@ -76,18 +86,18 @@ class BasicBlock(nn.Module):
                 )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.act(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
-        out = F.relu(out)
+        out = self.act(out)
         return out
 
 
 class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
+    def __init__(self, block, num_blocks, num_classes=10,act=nn.ReLU()):
         super(ResNet, self).__init__()
         self.in_planes = 16
-
+        self.act = act
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(16)
         self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
@@ -101,13 +111,13 @@ class ResNet(nn.Module):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
+            layers.append(block(self.in_planes, planes, stride,act=self.act))
             self.in_planes = planes * block.expansion
 
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.act(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
@@ -117,28 +127,28 @@ class ResNet(nn.Module):
         return out
 
 
-def resnet20():
-    return ResNet(BasicBlock, [3, 3, 3])
+def resnet20(act=nn.ReLU(),num_classes=10):
+    return ResNet(BasicBlock, [3, 3, 3],act=act,num_classes=num_classes)
 
 
-def resnet32():
-    return ResNet(BasicBlock, [5, 5, 5])
+def resnet32(act=nn.ReLU(),num_classes=10):
+    return ResNet(BasicBlock, [5, 5, 5],act=act,num_classes=num_classes)
 
 
-def resnet44():
-    return ResNet(BasicBlock, [7, 7, 7])
+def resnet44(act=nn.ReLU(),num_classes=10):
+    return ResNet(BasicBlock, [7, 7, 7],act=act,num_classes=num_classes)
 
 
-def resnet56():
-    return ResNet(BasicBlock, [9, 9, 9])
+def resnet56(act=nn.ReLU(),num_classes=10):
+    return ResNet(BasicBlock, [9, 9, 9],act=act,num_classes=num_classes)
 
 
-def resnet110():
-    return ResNet(BasicBlock, [18, 18, 18])
+def resnet110(act=nn.ReLU(),num_classes=10):
+    return ResNet(BasicBlock, [18, 18, 18],act=act,num_classes=num_classes)
 
 
-def resnet1202():
-    return ResNet(BasicBlock, [200, 200, 200])
+def resnet1202(act=nn.ReLU(),num_classes=10):
+    return ResNet(BasicBlock, [200, 200, 200],act=act,num_classes=num_classes)
 
 
 def test(net):
@@ -155,5 +165,5 @@ if __name__ == "__main__":
     for net_name in __all__:
         if net_name.startswith('resnet'):
             print(net_name)
-            test(globals()[net_name]())
+            test(globals()[net_name](act=sASN()))
             print()
