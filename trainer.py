@@ -383,11 +383,20 @@ def accuracy(output, target, topk=(1,)):
 
 
 if __name__ == '__main__':
-    acts=get_activations()
+    # acts=get_activations()
+    acts={
+        'SwishT':SwishT(),
+        'Swish':Swish(),
+        'GELU':GELU(),
+        'Mish':Mish(),
+        'SiLU':SiLU(),
+    }
     # acts['PReLU']=nn.PReLU()
     print(acts.keys())
     comp_dict = {}
-    for i in range(1,args.repeat+1):
+    range_ = range(1,args.repeat+1) # default
+    range_ = range(2,args.repeat+1) # once
+    for i in range_:
         for name,act in acts.items():
             print(f'act : {name}')
             res = main(act,name,i)
